@@ -122,7 +122,7 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_index(
-    _py: Python<'_>,
+    py: Python<'_>,
     nbits: i64,
     centroids: PyTensor,
     avg_residual: PyTensor,
@@ -138,47 +138,51 @@ pub fn construct_index(
 ) -> PyResult<PyLoadedIndex> {
     let main_device = get_device(&device)?;
 
-    // Force document tensors to CPU in low memory mode
-    let storage_device = if low_memory { Device::Cpu } else { main_device };
+    let loaded_index = py
+        .allow_threads(move || {
+            // Force document tensors to CPU in low memory mode
+            let storage_device = if low_memory { Device::Cpu } else { main_device };
 
-    // Load codec (small tensors)
-    let codec = ResidualCodec::load(
-        nbits,
-        ensure_tensor(centroids, main_device, Kind::Half),
-        ensure_tensor(avg_residual, main_device, Kind::Half),
-        Some(ensure_tensor(bucket_cutoffs, main_device, Kind::Half)),
-        Some(ensure_tensor(bucket_weights, main_device, Kind::Half)),
-        main_device,
-    )
-    .map_err(anyhow_to_pyerr)?;
+            // Load codec (small tensors)
+            let codec = ResidualCodec::load(
+                nbits,
+                ensure_tensor(centroids, main_device, Kind::Half),
+                ensure_tensor(avg_residual, main_device, Kind::Half),
+                Some(ensure_tensor(bucket_cutoffs, main_device, Kind::Half)),
+                Some(ensure_tensor(bucket_weights, main_device, Kind::Half)),
+                main_device,
+            )?;
 
-    // Build IVF index (None for compress-only indices)
-    let ivf_index_strided = match (ivf, ivf_lengths) {
-        (Some(ivf_t), Some(ivf_len_t)) => Some(StridedTensor::new(
-            ensure_tensor(ivf_t, main_device, Kind::Int64),
-            ensure_tensor(ivf_len_t, main_device, Kind::Int),
-            main_device,
-        )),
-        _ => None,
-    };
+            // Build IVF index (None for compress-only indices)
+            let ivf_index_strided = match (ivf, ivf_lengths) {
+                (Some(ivf_t), Some(ivf_len_t)) => Some(StridedTensor::new(
+                    ensure_tensor(ivf_t, main_device, Kind::Int64),
+                    ensure_tensor(ivf_len_t, main_device, Kind::Int),
+                    main_device,
+                )),
+                _ => None,
+            };
 
-    // Load document data (large tensors, may stay on CPU in low memory mode)
-    let doc_lens_t = ensure_tensor(doc_lengths, storage_device, Kind::Int64);
-    let doc_codes_t = ensure_tensor(doc_codes, storage_device, Kind::Int64);
-    let doc_residuals_t = ensure_tensor(doc_residuals, storage_device, Kind::Uint8);
+            // Load document data (large tensors, may stay on CPU in low memory mode)
+            let doc_lens_t = ensure_tensor(doc_lengths, storage_device, Kind::Int64);
+            let doc_codes_t = ensure_tensor(doc_codes, storage_device, Kind::Int64);
+            let doc_residuals_t = ensure_tensor(doc_residuals, storage_device, Kind::Uint8);
 
-    let doc_codes_strided =
-        StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), storage_device);
+            let doc_codes_strided =
+                StridedTensor::new(doc_codes_t, doc_lens_t.shallow_clone(), storage_device);
 
-    let doc_residuals_strided = StridedTensor::new(doc_residuals_t, doc_lens_t, storage_device);
+            let doc_residuals_strided =
+                StridedTensor::new(doc_residuals_t, doc_lens_t, storage_device);
 
-    let loaded_index = LoadedIndex {
-        codec,
-        ivf_index_strided,
-        doc_codes_strided,
-        doc_residuals_strided,
-        nbits,
-    };
+            Ok(LoadedIndex {
+                codec,
+                ivf_index_strided,
+                doc_codes_strided,
+                doc_residuals_strided,
+                nbits,
+            })
+        })
+        .map_err(anyhow_to_pyerr)?;
 
     Ok(PyLoadedIndex {
         inner: loaded_index,

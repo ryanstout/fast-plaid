@@ -130,7 +130,7 @@ fn initialize_torch(_py: Python<'_>, torch_path: String) -> PyResult<()> {
 ///     RuntimeError: If index creation fails or `libtorch` fails to load.
 #[pyfunction]
 fn create(
-    _py: Python<'_>,
+    py: Python<'_>,
     index: String,
     torch_path: String,
     device: String,
@@ -146,22 +146,22 @@ fn create(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device = get_device(&device)?;
-    let centroids = centroids.to_device(device).to_kind(Kind::Half);
 
-    let result = create_index(
-        &embeddings,
-        &index,
-        embedding_dim,
-        nbits,
-        device,
-        centroids,
-        batch_size,
-        seed,
-        compress_only,
-    )
-    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)));
-
-    result
+    py.allow_threads(move || {
+        let centroids = centroids.to_device(device).to_kind(Kind::Half);
+        create_index(
+            &embeddings,
+            &index,
+            embedding_dim,
+            nbits,
+            device,
+            centroids,
+            batch_size,
+            seed,
+            compress_only,
+        )
+    })
+    .map_err(|e| PyRuntimeError::new_err(format!("Failed to create index: {}", e)))
 }
 
 /// Performs a multi-vector search on a loaded index.
@@ -300,7 +300,7 @@ fn pysearch_with_token_scores(
 ///     RuntimeError: If updating the index fails or `libtorch` fails to load.
 #[pyfunction]
 fn update(
-    _py: Python<'_>,
+    py: Python<'_>,
     index_path: String,
     index: &PyLoadedIndex,
     torch_path: String,
@@ -313,15 +313,18 @@ fn update(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device_tch = get_device(&device)?;
+    let index_inner = &index.inner;
 
-    update_index(
-        &embeddings,
-        &index_path,
-        device_tch,
-        batch_size,
-        &index.inner,
-        update_threshold_centroids.unwrap_or(false),
-    )
+    py.allow_threads(move || {
+        update_index(
+            &embeddings,
+            &index_path,
+            device_tch,
+            batch_size,
+            index_inner,
+            update_threshold_centroids.unwrap_or(false),
+        )
+    })
     .map_err(|e| PyRuntimeError::new_err(format!("Failed to update index: {}", e)))?;
 
     Ok(())
@@ -346,7 +349,7 @@ fn update(
 ///     RuntimeError: If deletion fails or `libtorch` fails to load.
 #[pyfunction]
 fn delete(
-    _py: Python<'_>,
+    py: Python<'_>,
     index: String,
     torch_path: String,
     device: String,
@@ -357,10 +360,8 @@ fn delete(
 
     let device = get_device(&device)?;
 
-    let result = delete_from_index(&subset, &index, device)
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete from index: {}", e)));
-
-    result
+    py.allow_threads(move || delete_from_index(&subset, &index, device))
+        .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete from index: {}", e)))
 }
 
 #[pymodule]
