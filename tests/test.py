@@ -1,10 +1,11 @@
 import os
 import shutil
+import threading
 from datetime import date
 
 import pytest
 import torch
-from fast_plaid import filtering, search
+from fast_plaid import fast_plaid_rust, filtering, search
 
 
 @pytest.fixture
@@ -30,6 +31,32 @@ def fast_plaid_index(test_index_path):
 
 class TestBasicCreateAndSearch:
     """Tests for basic index creation and search functionality."""
+
+    def test_rust_index_write_lock_releases_gil_while_waiting(self, test_index_path):
+        """A contended native index lock should not pin the Python GIL."""
+        first_guard = fast_plaid_rust.index_write_lock(index_path=test_index_path)
+        contender_started = threading.Event()
+        contender_acquired = threading.Event()
+        release_contender = threading.Event()
+
+        def acquire_contended_lock() -> None:
+            contender_started.set()
+            second_guard = fast_plaid_rust.index_write_lock(index_path=test_index_path)
+            contender_acquired.set()
+            release_contender.wait(timeout=5)
+            second_guard.release()
+
+        thread = threading.Thread(target=acquire_contended_lock)
+        thread.start()
+
+        assert contender_started.wait(timeout=5)
+        assert not contender_acquired.wait(timeout=0.1)
+
+        first_guard.release()
+        assert contender_acquired.wait(timeout=5)
+        release_contender.set()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
 
     def test_create_and_search_basic(self, test_index_path):
         """Ensure that the Fast-PLAiD search index can be created and queried correctly."""

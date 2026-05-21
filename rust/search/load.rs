@@ -1,5 +1,9 @@
 use anyhow::Result;
+use once_cell::sync::Lazy;
+use parking_lot::{Condvar, Mutex};
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tch::{Device, Kind, Tensor};
 
 use pyo3::exceptions::PyValueError;
@@ -9,6 +13,115 @@ use pyo3_tch::PyTensor;
 use crate::search::tensor::StridedTensor;
 use crate::utils::errors::anyhow_to_pyerr;
 use crate::utils::residual_codec::ResidualCodec;
+
+static INDEX_LOCKS: Lazy<Mutex<HashMap<String, Arc<IndexPathLock>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(Default)]
+struct IndexLockState {
+    active_readers: usize,
+    waiting_writers: usize,
+    writer_active: bool,
+}
+
+#[derive(Default)]
+struct IndexPathLock {
+    state: Mutex<IndexLockState>,
+    changed: Condvar,
+}
+
+enum IndexLockMode {
+    Read,
+    Write,
+}
+
+pub struct IndexLockGuard {
+    lock: Arc<IndexPathLock>,
+    mode: IndexLockMode,
+}
+
+fn lock_for_index(index_path: &str) -> Arc<IndexPathLock> {
+    let mut locks = INDEX_LOCKS.lock();
+    locks
+        .entry(index_path.to_string())
+        .or_insert_with(|| Arc::new(IndexPathLock::default()))
+        .clone()
+}
+
+pub fn acquire_index_read(index_path: &str) -> IndexLockGuard {
+    let lock = lock_for_index(index_path);
+    {
+        let mut state = lock.state.lock();
+        while state.writer_active || state.waiting_writers > 0 {
+            lock.changed.wait(&mut state);
+        }
+        state.active_readers += 1;
+    }
+    IndexLockGuard {
+        lock,
+        mode: IndexLockMode::Read,
+    }
+}
+
+fn acquire_index_write(index_path: &str) -> IndexLockGuard {
+    let lock = lock_for_index(index_path);
+    {
+        let mut state = lock.state.lock();
+        state.waiting_writers += 1;
+        while state.writer_active || state.active_readers > 0 {
+            lock.changed.wait(&mut state);
+        }
+        state.waiting_writers -= 1;
+        state.writer_active = true;
+    }
+    IndexLockGuard {
+        lock,
+        mode: IndexLockMode::Write,
+    }
+}
+
+pub fn index_write_lock_for_rust(index_path: &str) -> IndexLockGuard {
+    acquire_index_write(index_path)
+}
+
+impl Drop for IndexLockGuard {
+    fn drop(&mut self) {
+        let mut state = self.lock.state.lock();
+        match self.mode {
+            IndexLockMode::Read => {
+                state.active_readers -= 1;
+            }
+            IndexLockMode::Write => {
+                state.writer_active = false;
+            }
+        }
+        self.lock.changed.notify_all();
+    }
+}
+
+#[pyclass]
+pub struct PyIndexWriteLock {
+    guard: Option<IndexLockGuard>,
+}
+
+#[pymethods]
+impl PyIndexWriteLock {
+    fn release(&mut self) {
+        self.guard.take();
+    }
+}
+
+impl Drop for PyIndexWriteLock {
+    fn drop(&mut self) {
+        self.guard.take();
+    }
+}
+
+#[pyfunction]
+pub fn index_write_lock(py: Python<'_>, index_path: String) -> PyResult<PyIndexWriteLock> {
+    let guard = py.allow_threads(move || acquire_index_write(&index_path));
+    Ok(PyIndexWriteLock { guard: Some(guard) })
+}
 
 /// Parses a Python-style device string into a `tch::Device`.
 ///
@@ -65,6 +178,7 @@ unsafe impl Sync for LoadedIndex {}
 /// the Rust memory is freed.
 #[pyclass]
 pub struct PyLoadedIndex {
+    pub index_path: String,
     pub inner: LoadedIndex,
 }
 
@@ -120,6 +234,21 @@ fn ensure_tensor(t: PyTensor, device: Device, kind: Kind) -> Tensor {
 /// * `device` - The target device string (e.g. "cuda:0").
 /// * `low_memory` - If true, keeps document data on CPU.
 #[pyfunction]
+#[pyo3(signature = (
+    nbits,
+    centroids,
+    avg_residual,
+    bucket_cutoffs,
+    bucket_weights,
+    ivf,
+    ivf_lengths,
+    doc_codes,
+    doc_residuals,
+    doc_lengths,
+    device,
+    low_memory,
+    index_path = None
+))]
 #[allow(clippy::too_many_arguments)]
 pub fn construct_index(
     py: Python<'_>,
@@ -135,6 +264,7 @@ pub fn construct_index(
     doc_lengths: PyTensor,
     device: String,
     low_memory: bool,
+    index_path: Option<String>,
 ) -> PyResult<PyLoadedIndex> {
     let main_device = get_device(&device)?;
 
@@ -185,6 +315,7 @@ pub fn construct_index(
         .map_err(anyhow_to_pyerr)?;
 
     Ok(PyLoadedIndex {
+        index_path: index_path.unwrap_or_default(),
         inner: loaded_index,
     })
 }

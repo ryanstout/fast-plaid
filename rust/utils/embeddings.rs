@@ -4,7 +4,7 @@ use pyo3_tch::PyTensor;
 use rayon::prelude::*;
 use tch::{Kind, Tensor};
 
-use crate::search::load::{get_device, PyLoadedIndex};
+use crate::search::load::{acquire_index_read, get_device, PyLoadedIndex};
 use crate::search::search::decompress_residuals;
 use crate::utils::errors::anyhow_to_pyerr;
 
@@ -17,9 +17,11 @@ pub fn reconstruct_embeddings(
 ) -> PyResult<Vec<PyTensor>> {
     let device = get_device(&device)?;
     let inner = &index.inner;
+    let index_path = index.index_path.clone();
 
     let tensors: Vec<Tensor> = py
         .allow_threads(move || {
+            let _index_guard = acquire_index_read(&index_path);
             subset
                 .into_par_iter()
                 .map(|doc_id| {

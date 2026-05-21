@@ -43,23 +43,28 @@ def partial_reload(
         Whether to use low memory mode when loading.
 
     """
-    # Clear old indices first to release memory-mapped file handles
-    # This is critical on Windows where files can't be modified while mapped
-    indices_dict.clear()
-    gc.collect()
+    reload_guard = fast_plaid_rust.index_write_lock(index_path=index_path)
+    try:
+        # Clear old indices first to release memory-mapped file handles
+        # This is critical on Windows where files can't be modified while mapped
+        indices_dict.clear()
+        gc.collect()
 
-    cpu_tensors = _load_index_tensors_cpu(index_path=index_path)
-    if cpu_tensors is None:
+        cpu_tensors = _load_index_tensors_cpu(index_path=index_path)
+        if cpu_tensors is None:
+            return indices_dict
+
+        for device in devices:
+            indices_dict[device] = _construct_index_from_tensors(
+                data=cpu_tensors,
+                device=device,
+                low_memory=low_memory,
+                index_path=index_path,
+            )
+
         return indices_dict
-
-    for device in devices:
-        indices_dict[device] = _construct_index_from_tensors(
-            data=cpu_tensors,
-            device=device,
-            low_memory=low_memory,
-        )
-
-    return indices_dict
+    finally:
+        reload_guard.release()
 
 
 def update_centroids(  # noqa: PLR0912

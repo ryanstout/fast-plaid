@@ -323,7 +323,7 @@ def _load_index_tensors_cpu(index_path: str) -> dict[str, Any] | None:
 
 
 def _construct_index_from_tensors(
-    data: dict[str, Any], device: str, low_memory: bool
+    data: dict[str, Any], device: str, low_memory: bool, index_path: str
 ) -> Any:
     """Build Rust index from CPU tensors.
 
@@ -335,6 +335,8 @@ def _construct_index_from_tensors(
         The target device for the index.
     low_memory:
         If True, keeps large document tensors on CPU to save VRAM.
+    index_path:
+        The index directory used to coordinate native search and reload locks.
 
     """
     gpu_data: dict[str, Any] = {}
@@ -362,6 +364,7 @@ def _construct_index_from_tensors(
         doc_lengths=gpu_data["doc_lengths"],
         device=device,
         low_memory=low_memory,
+        index_path=index_path,
     )
 
 
@@ -385,46 +388,51 @@ def _reload_index(
         If True, keeps large document tensors on CPU.
 
     """
-    if not os.path.exists(os.path.join(index_path, "metadata.json")):
-        for device in devices:
-            indices[device] = None
-        return indices
-
+    reload_guard = fast_plaid_rust.index_write_lock(index_path=index_path)
     try:
-        cpu_tensors = _load_index_tensors_cpu(index_path=index_path)
-    except Exception as e:
-        print(f"Critical Error loading index from disk: {e}")
-        for device in devices:
-            indices[device] = None
-        return indices
+        if not os.path.exists(os.path.join(index_path, "metadata.json")):
+            for device in devices:
+                indices[device] = None
+            return indices
 
-    if cpu_tensors is None:
-        for device in devices:
-            indices[device] = None
-        return indices
-
-    def _provision_gpu(device: str) -> tuple[str, Any]:
         try:
-            idx = _construct_index_from_tensors(
-                data=cpu_tensors,  # noqa: F821
-                device=device,
-                low_memory=low_memory,
-            )
-            return device, idx  # noqa: TRY300
+            cpu_tensors = _load_index_tensors_cpu(index_path=index_path)
         except Exception as e:
-            print(f"Warning: Failed to load index on {device}: {e}")
-        return device, None
+            print(f"Critical Error loading index from disk: {e}")
+            for device in devices:
+                indices[device] = None
+            return indices
 
-    if len(devices) == 1:
-        dev, idx = _provision_gpu(devices[0])
-        indices[dev] = idx
-    else:
-        with ThreadPoolExecutor(max_workers=len(devices)) as executor:
-            results = executor.map(_provision_gpu, devices)
-            indices = dict(results)
+        if cpu_tensors is None:
+            for device in devices:
+                indices[device] = None
+            return indices
 
-    del cpu_tensors
-    return indices
+        def _provision_gpu(device: str) -> tuple[str, Any]:
+            try:
+                idx = _construct_index_from_tensors(
+                    data=cpu_tensors,  # noqa: F821
+                    device=device,
+                    low_memory=low_memory,
+                    index_path=index_path,
+                )
+                return device, idx  # noqa: TRY300
+            except Exception as e:
+                print(f"Warning: Failed to load index on {device}: {e}")
+            return device, None
+
+        if len(devices) == 1:
+            dev, idx = _provision_gpu(devices[0])
+            indices[dev] = idx
+        else:
+            with ThreadPoolExecutor(max_workers=len(devices)) as executor:
+                results = executor.map(_provision_gpu, devices)
+                indices = dict(results)
+
+        del cpu_tensors
+        return indices
+    finally:
+        reload_guard.release()
 
 
 def save_list_tensors_on_disk(path: str, tensors: list[torch.Tensor]) -> None:

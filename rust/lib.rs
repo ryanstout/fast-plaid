@@ -23,7 +23,10 @@ use winapi::um::libloaderapi::LoadLibraryA;
 use crate::index::create::create_index;
 use crate::index::delete::delete_from_index;
 use crate::index::update::update_index;
-use search::load::{construct_index, get_device, PyLoadedIndex};
+use search::load::{
+    acquire_index_read, construct_index, get_device, index_write_lock, index_write_lock_for_rust,
+    PyIndexWriteLock, PyLoadedIndex,
+};
 use search::search::{
     search_many, search_many_with_token_scores, QueryResult, QueryResultWithTokenScores,
     SearchParameters,
@@ -146,8 +149,10 @@ fn create(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device = get_device(&device)?;
+    let index_path_for_lock = index.clone();
 
     py.allow_threads(move || {
+        let _index_guard = index_write_lock_for_rust(&index_path_for_lock);
         let centroids = centroids.to_device(device).to_kind(Kind::Half);
         create_index(
             &embeddings,
@@ -204,10 +209,12 @@ fn pysearch(
     let device_tch = get_device(&device)?;
     let params = search_parameters.clone();
     let index_inner = &index.inner;
+    let index_path = index.index_path.clone();
 
     // Release the GIL to allow for parallel execution in Python threads.
     let results = py
         .allow_threads(move || {
+            let _index_guard = acquire_index_read(&index_path);
             search_many(
                 &queries_embeddings,
                 index_inner,
@@ -257,9 +264,11 @@ fn pysearch_with_token_scores(
     let device_tch = get_device(&device)?;
     let params = search_parameters.clone();
     let index_inner = &index.inner;
+    let index_path = index.index_path.clone();
 
     let results = py
         .allow_threads(move || {
+            let _index_guard = acquire_index_read(&index_path);
             search_many_with_token_scores(
                 &queries_embeddings,
                 index_inner,
@@ -314,8 +323,10 @@ fn update(
 
     let device_tch = get_device(&device)?;
     let index_inner = &index.inner;
+    let index_path_for_lock = index_path.clone();
 
     py.allow_threads(move || {
+        let _index_guard = index_write_lock_for_rust(&index_path_for_lock);
         update_index(
             &embeddings,
             &index_path,
@@ -359,8 +370,12 @@ fn delete(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to load Torch library: {}", e)))?;
 
     let device = get_device(&device)?;
+    let index_path_for_lock = index.clone();
 
-    py.allow_threads(move || delete_from_index(&subset, &index, device))
+    py.allow_threads(move || {
+        let _index_guard = index_write_lock_for_rust(&index_path_for_lock);
+        delete_from_index(&subset, &index, device)
+    })
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to delete from index: {}", e)))
 }
 
@@ -371,8 +386,10 @@ fn python_module(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<QueryResult>()?;
     m.add_class::<QueryResultWithTokenScores>()?;
     m.add_class::<PyLoadedIndex>()?;
+    m.add_class::<PyIndexWriteLock>()?;
 
     m.add_function(wrap_pyfunction!(initialize_torch, m)?)?;
+    m.add_function(wrap_pyfunction!(index_write_lock, m)?)?;
     m.add_function(wrap_pyfunction!(construct_index, m)?)?;
     m.add_function(wrap_pyfunction!(create, m)?)?;
     m.add_function(wrap_pyfunction!(pysearch, m)?)?;
